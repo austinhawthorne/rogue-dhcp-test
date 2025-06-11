@@ -1,64 +1,99 @@
 #!/usr/bin/env python3
 import argparse
 import subprocess
-from scapy.all import sniff, DHCP, BOOTP, IP
+from scapy.all import (
+    sniff, sendp,
+    Ether, IP, UDP, BOOTP, DHCP,
+    get_if_hwaddr
+)
 
-# Will be set to the user’s desired DHCP server IP (string), or None
-TARGET_SERVER = None
+TARGET_SERVER = None       # IP of the DHCP server we want to accept, if any
+_requested = False         # Have we already sent our custom REQUEST?
+_offers = {}               # Map server_ip → (offered_ip, xid)
 
-seen = set()
+def handle_dhcp_response(pkt):
+    global _requested
 
-def handle_dhcp_response(packet):
-    if not packet.haslayer(DHCP):
+    if not pkt.haslayer(DHCP):
         return
 
-    # Get message-type option
-    opts = packet[DHCP].options
+    # Pull out message-type
+    opts = pkt[DHCP].options
     msg = next((v for (k, v) in opts if k == 'message-type'), None)
-    if msg not in (2, 5):   # 2 = OFFER, 5 = ACK
+    if msg not in (2, 5):   # 2=OFFER, 5=ACK
         return
 
-    resp = "OFFER" if msg == 2 else "ACK"
-    server_ip = packet[IP].src
-    offered_ip = packet[BOOTP].yiaddr
+    server_ip  = pkt[IP].src
+    your_ip    = pkt[BOOTP].yiaddr
+    xid        = pkt[BOOTP].xid
+    resp_name  = "OFFER" if msg == 2 else "ACK"
 
-    # If the user supplied a target server, ignore others
-    if TARGET_SERVER and server_ip != TARGET_SERVER:
-        return
+    # 1) Display EVERY unique offer/ack
+    key = (resp_name, server_ip, your_ip)
+    if key not in _offers:
+        _offers[key] = xid
+        print(f"[Client] DHCP {resp_name} from {server_ip} → your IP {your_ip}")
 
-    key = (resp, server_ip, offered_ip)
-    if key not in seen:
-        seen.add(key)
-        print(f"[Client] DHCP {resp} from {server_ip} → your IP {offered_ip}")
+    # 2) If this is an OFFER from our target server, send a custom REQUEST
+    if msg == 2 and TARGET_SERVER == server_ip and not _requested:
+        send_explicit_request(iface=args.interface,
+                              server_ip=server_ip,
+                              offered_ip=your_ip,
+                              xid=xid)
+        _requested = True
 
-def send_request(iface):
-    # Release existing lease, then fire off one-shot DISCOVER→REQUEST
+def send_explicit_request(iface, server_ip, offered_ip, xid):
+    """
+    Craft and send a DHCPREQUEST to accept the given OFFER.
+    """
+    client_mac = get_if_hwaddr(iface)
+    # chaddr needs 16 bytes: MAC (6 bytes) + padding (10 bytes)
+    mac_bytes = bytes.fromhex(client_mac.replace(":", "")) + b"\x00" * 10
+
+    pkt = (
+        Ether(src=client_mac, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=1, chaddr=mac_bytes, xid=xid) /
+        DHCP(options=[
+            ("message-type", "request"),
+            ("server_id", server_ip),
+            ("requested_addr", offered_ip),
+            "end"
+        ])
+    )
+    sendp(pkt, iface=iface, verbose=False)
+    print(f"[Client] Sent custom DHCPREQUEST to accept OFFER from {server_ip}")
+
+def kick_host_dhcp(iface):
+    """
+    Use the system dhclient just to fire off DISCOVER/REQUEST.
+    We still capture all OFFERS and then send our own REQUEST if needed.
+    """
     subprocess.run(['dhclient', '-r', iface],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # one-shot discover+request
     subprocess.Popen(['dhclient', '-1', iface],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def main():
-    global TARGET_SERVER
-
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Listen for DHCP replies (optionally filtering to one server)"
+        description="Detect all DHCP servers, and optionally accept one"
     )
     parser.add_argument("-i", "--interface", required=True,
-                        help="Network interface (e.g. eth0)")
+                        help="Network interface (e.g., eth0)")
     parser.add_argument("-t", "--timeout", type=int, default=10,
-                        help="Seconds to listen for replies (default: 10)")
-    parser.add_argument("-s", "--server", dest="target_server", default=None,
-                        help="Only accept replies from this DHCP server IP")
+                        help="Seconds to listen for replies")
+    parser.add_argument("-s", "--server", dest="target", default=None,
+                        help="Server IP whose OFFER we should accept")
     args = parser.parse_args()
-
-    TARGET_SERVER = args.target_server
+    TARGET_SERVER = args.target
 
     print(f"[Client] Triggering host DHCP client on {args.interface}…")
-    send_request(args.interface)
+    kick_host_dhcp(args.interface)
 
-    print(f"[Client] Sniffing for {args.timeout}s "
-          f"{'from server '+TARGET_SERVER if TARGET_SERVER else 'from all servers'}…")
+    mode = f"and accepting {TARGET_SERVER}" if TARGET_SERVER else "from all servers"
+    print(f"[Client] Sniffing for {args.timeout}s {mode}…")
     sniff(
         iface=args.interface,
         filter="udp and (port 67 or port 68)",
@@ -67,6 +102,3 @@ def main():
     )
 
     print("[Client] Done scanning.")
-
-if __name__ == "__main__":
-    main()
