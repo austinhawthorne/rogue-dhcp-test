@@ -1,4 +1,4 @@
-Quick qay to test if you have any rogue DHCP servers on your network and if your network is allowing them.  Contains two scripts, one that runs a test rogue DHCP server and one that forces a client to initiate a DHCP request and logs which servers respond.  
+Quick way to test if you have any rogue DHCP servers on your network and if your network is allowing them.  Contains two scripts, one that runs a test rogue DHCP server and one that forces a client to initiate a DHCP request and logs which servers respond.  
 
 To test, run on hosts that are mapped to the same VLAN/Subnet
 
